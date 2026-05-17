@@ -414,14 +414,16 @@ def save_to_excel(clinics: list[dict], output_path: str):
 
     sorted_clinics = sorted(clinics, key=lambda c: (c["calidad_web"], c["nombre"]))
 
+    link_font = Font(color="0563C1", underline="single", size=10)
+
     for row_idx, clinic in enumerate(sorted_clinics, 2):
         values = [
             clinic["nombre"],
             clinic["telefono"],
             clinic["email"],
             clinic["direccion"],
-            clinic["web"],
-            clinic["google_maps"],
+            None,
+            None,
             clinic["calidad_web"],
             clinic["descripcion_web"],
             clinic["rating"],
@@ -430,12 +432,23 @@ def save_to_excel(clinics: list[dict], output_path: str):
         for col_idx, value in enumerate(values, 1):
             cell = ws.cell(row=row_idx, column=col_idx, value=value)
             cell.border = thin_border
-            cell.alignment = Alignment(vertical="center", wrap_text=True)
+            cell.alignment = Alignment(vertical="center", wrap_text=col_idx == 4)
 
-            if col_idx in (5, 6) and value:
-                cell.font = Font(color="0563C1", underline="single")
+        if clinic["web"]:
+            cell_web = ws.cell(row=row_idx, column=5, value="Ver web")
+            cell_web.hyperlink = clinic["web"]
+            cell_web.font = link_font
+            cell_web.border = thin_border
+            cell_web.alignment = Alignment(vertical="center", horizontal="center")
 
-    col_widths = {1: 35, 2: 18, 3: 30, 4: 45, 5: 40, 6: 40, 7: 22, 8: 50, 9: 10, 10: 12}
+        if clinic["google_maps"]:
+            cell_map = ws.cell(row=row_idx, column=6, value="Ver mapa")
+            cell_map.hyperlink = clinic["google_maps"]
+            cell_map.font = link_font
+            cell_map.border = thin_border
+            cell_map.alignment = Alignment(vertical="center", horizontal="center")
+
+    col_widths = {1: 30, 2: 16, 3: 25, 4: 35, 5: 12, 6: 12, 7: 18, 8: 35, 9: 8, 10: 10}
     for col_idx, width in col_widths.items():
         ws.column_dimensions[get_column_letter(col_idx)].width = width
 
