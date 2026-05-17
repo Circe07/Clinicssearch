@@ -101,6 +101,12 @@ def parse_args():
         default=5,
         help="Hilos paralelos para analizar webs (default: 5).",
     )
+    parser.add_argument(
+        "--min-reviews", "-n",
+        type=int,
+        default=50,
+        help="Mínimo de reseñas para incluir una clínica (default: 50).",
+    )
     return parser.parse_args()
 
 
@@ -334,9 +340,9 @@ def load_existing_clinics(output_path: str) -> list[dict]:
             "google_maps": row[5] or "",
             "calidad_web": row[6] or "",
             "descripcion_web": row[7] or "",
-            "rating": row[8] if row[8] is not None else "",
-            "num_reviews": row[9] if row[9] is not None else "",
-            "oportunidad": (row[10] or "").upper() == "SÍ",
+            "rating": row[8] if len(row) > 8 and row[8] is not None else "",
+            "num_reviews": row[9] if len(row) > 9 and row[9] is not None else "",
+            "oportunidad": True,
         })
 
     wb.close()
@@ -385,7 +391,6 @@ def save_to_excel(clinics: list[dict], output_path: str):
         "Descripción",
         "Rating",
         "Nº Reseñas",
-        "¿Oportunidad?",
     ]
 
     header_fill = PatternFill(start_color="1F4E79", end_color="1F4E79", fill_type="solid")
@@ -407,7 +412,7 @@ def save_to_excel(clinics: list[dict], output_path: str):
 
     ws.auto_filter.ref = f"A1:{get_column_letter(len(headers))}1"
 
-    sorted_clinics = sorted(clinics, key=lambda c: (not c["oportunidad"], c["calidad_web"], c["nombre"]))
+    sorted_clinics = sorted(clinics, key=lambda c: (c["calidad_web"], c["nombre"]))
 
     for row_idx, clinic in enumerate(sorted_clinics, 2):
         values = [
@@ -421,20 +426,16 @@ def save_to_excel(clinics: list[dict], output_path: str):
             clinic["descripcion_web"],
             clinic["rating"],
             clinic["num_reviews"],
-            "SÍ" if clinic["oportunidad"] else "NO",
         ]
         for col_idx, value in enumerate(values, 1):
             cell = ws.cell(row=row_idx, column=col_idx, value=value)
             cell.border = thin_border
             cell.alignment = Alignment(vertical="center", wrap_text=True)
 
-            if clinic["oportunidad"]:
-                cell.fill = oportunidad_fill
-
             if col_idx in (5, 6) and value:
                 cell.font = Font(color="0563C1", underline="single")
 
-    col_widths = {1: 35, 2: 18, 3: 30, 4: 45, 5: 40, 6: 40, 7: 22, 8: 50, 9: 10, 10: 12, 11: 14}
+    col_widths = {1: 35, 2: 18, 3: 30, 4: 45, 5: 40, 6: 40, 7: 22, 8: 50, 9: 10, 10: 12}
     for col_idx, width in col_widths.items():
         ws.column_dimensions[get_column_letter(col_idx)].width = width
 
@@ -445,17 +446,14 @@ def save_to_excel(clinics: list[dict], output_path: str):
     ws_stats = wb.create_sheet("Resumen")
     stats_header_font = Font(name="Calibri", size=12, bold=True)
     stats_data = [
-        ("Resumen de Búsqueda", ""),
+        ("Resumen de Oportunidades", ""),
         ("", ""),
-        ("Total clínicas encontradas", len(clinics)),
+        ("Total oportunidades guardadas", len(clinics)),
+        ("", ""),
         ("Sin página web", sum(1 for c in clinics if c["calidad_web"] == "Sin web")),
         ("Web inaccesible", sum(1 for c in clinics if c["calidad_web"] == "Web inaccesible")),
         ("Web muy básica / en construcción", sum(1 for c in clinics if "MUY BÁSICA" in c["calidad_web"])),
         ("Web básica", sum(1 for c in clinics if c["calidad_web"] == "BÁSICA")),
-        ("Web aceptable", sum(1 for c in clinics if c["calidad_web"] == "ACEPTABLE")),
-        ("Web profesional", sum(1 for c in clinics if c["calidad_web"] == "PROFESIONAL")),
-        ("", ""),
-        ("TOTAL OPORTUNIDADES", sum(1 for c in clinics if c["oportunidad"])),
     ]
 
     for row_idx, (label, value) in enumerate(stats_data, 1):
@@ -483,10 +481,11 @@ def main():
     print("=" * 60)
     print(f"\n  Búsqueda: {args.query}")
     print(f"  Max resultados: {args.max_results}")
+    print(f"  Mín. reseñas: {args.min_reviews}")
     print(f"  Archivo de salida: {args.output}")
     print()
 
-    print("[1/3] Buscando clínicas en Google Places...")
+    print("[1/4] Buscando clínicas en Google Places...")
     places = search_places(args.query, args.api_key, args.max_results)
 
     if not places:
@@ -495,8 +494,8 @@ def main():
 
     print(f"      Se encontraron {len(places)} clínicas.")
 
-    print(f"\n[2/3] Analizando webs de las clínicas ({args.workers} hilos)...")
-    clinics = []
+    print(f"\n[2/4] Analizando webs de las clínicas ({args.workers} hilos)...")
+    clinics_raw = []
     with ThreadPoolExecutor(max_workers=args.workers) as executor:
         futures = {
             executor.submit(process_clinic, place): place
@@ -505,7 +504,7 @@ def main():
         for i, future in enumerate(as_completed(futures), 1):
             try:
                 clinic = future.result()
-                clinics.append(clinic)
+                clinics_raw.append(clinic)
                 status = "✓ OPORTUNIDAD" if clinic["oportunidad"] else "  ok"
                 print(f"      [{i}/{len(places)}] {status} - {clinic['nombre'][:50]} ({clinic['calidad_web']})")
             except Exception as e:
@@ -514,37 +513,53 @@ def main():
                 place_name = place_name.get("text", "?") if isinstance(place_name, dict) else "?"
                 print(f"      [{i}/{len(places)}] ✗ Error procesando {place_name}: {e}")
 
+    print(f"\n[3/4] Filtrando resultados...")
+    clinics = []
+    filtered_reviews = 0
+    filtered_no_oportunidad = 0
+    for c in clinics_raw:
+        reviews = c["num_reviews"]
+        review_count = int(reviews) if str(reviews).isdigit() else 0
+        if review_count < args.min_reviews:
+            filtered_reviews += 1
+            continue
+        if not c["oportunidad"]:
+            filtered_no_oportunidad += 1
+            continue
+        clinics.append(c)
+
+    print(f"      {len(clinics_raw)} clínicas analizadas")
+    print(f"      {filtered_reviews} descartadas por menos de {args.min_reviews} reseñas")
+    print(f"      {filtered_no_oportunidad} descartadas por tener buena web")
+    print(f"      {len(clinics)} oportunidades válidas")
+
     existing_clinics = load_existing_clinics(args.output)
     if existing_clinics:
-        print(f"\n[3/4] Archivo '{args.output}' ya existe con {len(existing_clinics)} clínicas. Fusionando...")
+        print(f"\n      Archivo '{args.output}' ya existe con {len(existing_clinics)} clínicas. Fusionando...")
         all_clinics, added, skipped = merge_clinics(existing_clinics, clinics)
         print(f"      → {added} clínicas nuevas añadidas")
         print(f"      → {skipped} duplicadas ignoradas")
-        step_save = "[4/4]"
     else:
         all_clinics = clinics
         added = len(clinics)
         skipped = 0
-        step_save = "[3/3]"
 
-    print(f"\n{step_save} Guardando resultados en {args.output}...")
+    print(f"\n[4/4] Guardando resultados en {args.output}...")
     save_to_excel(all_clinics, args.output)
 
-    oportunidades = sum(1 for c in all_clinics if c["oportunidad"])
     sin_web = sum(1 for c in all_clinics if c["calidad_web"] == "Sin web")
     basica = sum(1 for c in all_clinics if "BÁSICA" in c["calidad_web"])
 
     print("\n" + "=" * 60)
     print("  RESUMEN")
     print("=" * 60)
-    print(f"  Total clínicas:       {len(all_clinics)}")
+    print(f"  Total en Excel:       {len(all_clinics)}")
     if existing_clinics:
-        print(f"    (existentes:        {len(existing_clinics)})")
+        print(f"    (ya existían:       {len(existing_clinics)})")
         print(f"    (nuevas añadidas:   {added})")
         print(f"    (duplicadas:        {skipped})")
     print(f"  Sin web:              {sin_web}")
     print(f"  Web básica:           {basica}")
-    print(f"  OPORTUNIDADES:        {oportunidades}")
     print(f"\n  Archivo guardado en:  {args.output}")
     print("=" * 60)
 
