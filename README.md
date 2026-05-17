@@ -34,7 +34,18 @@ Script de Python que busca clínicas en una zona determinada y detecta cuáles *
 pip install -r requirements.txt
 ```
 
-## Uso
+## Uso rápido (Windows)
+
+Haz doble clic en **`buscar_clinicas.bat`** y sigue las instrucciones:
+
+1. La primera vez te pedirá tu **API key de Google Places** (se guarda automáticamente para futuras ejecuciones).
+2. Cada vez que lo ejecutes te preguntará **qué quieres buscar**.
+3. Puedes hacer múltiples búsquedas seguidas sin salir del programa.
+4. Los resultados se van acumulando en el mismo Excel sin duplicar.
+
+> Para cambiar la API key, borra el archivo `.api_key` que se crea en la misma carpeta.
+
+## Uso por línea de comandos
 
 ```bash
 # Búsqueda básica
