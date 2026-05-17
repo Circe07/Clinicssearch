@@ -90,6 +90,21 @@ if !ERRORLEVEL! neq 0 (
 echo.
 echo ============================================================
 
+set "BUSCAR_EMAIL="
+set /p "BUSCAR_EMAIL=   Quieres buscar emails que faltan en el Excel? (s/n): "
+if /i "!BUSCAR_EMAIL!"=="s" goto BUSCAR_EMAILS
+if /i "!BUSCAR_EMAIL!"=="si" goto BUSCAR_EMAILS
+goto PREGUNTAR_OTRA
+
+:BUSCAR_EMAILS
+echo.
+echo   Buscando emails en las webs de las clinicas...
+echo.
+python buscar_emails.py -i "!OUTPUT!"
+echo.
+echo ============================================================
+
+:PREGUNTAR_OTRA
 set "OTRA="
 set /p "OTRA=   Quieres hacer otra busqueda? (s/n): "
 if /i "!OTRA!"=="s" goto MENU
