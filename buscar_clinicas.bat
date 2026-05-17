@@ -60,6 +60,11 @@ if "!QUERY!"=="" (
     goto MENU
 )
 
+set "MIN_REVIEWS="
+echo.
+set /p "MIN_REVIEWS=   Minimo de resenas para incluir (Enter = 50): "
+if "!MIN_REVIEWS!"=="" set "MIN_REVIEWS=50"
+
 set "OUTPUT="
 echo.
 set /p "OUTPUT=   Nombre del archivo Excel (Enter = clinicas_prospecto.xlsx): "
@@ -68,12 +73,13 @@ if "!OUTPUT!"=="" set "OUTPUT=clinicas_prospecto.xlsx"
 echo.
 echo ============================================================
 echo   Lanzando busqueda...
-echo   Busqueda: !QUERY!
-echo   Archivo:  !OUTPUT!
+echo   Busqueda:      !QUERY!
+echo   Min. resenas:  !MIN_REVIEWS!
+echo   Archivo:       !OUTPUT!
 echo ============================================================
 echo.
 
-python buscar_clinicas.py -k "!API_KEY!" -q "!QUERY!" -o "!OUTPUT!"
+python buscar_clinicas.py -k "!API_KEY!" -q "!QUERY!" -o "!OUTPUT!" -n !MIN_REVIEWS!
 
 if !ERRORLEVEL! neq 0 (
     echo.
