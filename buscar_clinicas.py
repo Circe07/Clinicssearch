@@ -13,6 +13,7 @@ Uso:
 """
 
 import argparse
+import os
 import re
 import sys
 import time
@@ -21,7 +22,7 @@ from urllib.parse import urlparse
 
 import requests
 from bs4 import BeautifulSoup
-from openpyxl import Workbook
+from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 
@@ -287,6 +288,75 @@ def process_clinic(place: dict, api_key: str) -> dict:
     }
 
 
+def _clinic_key(nombre: str, direccion: str) -> str:
+    """Genera una clave única para identificar duplicados (nombre + dirección normalizados)."""
+    return (nombre.strip().lower() + "|" + direccion.strip().lower())
+
+
+def load_existing_clinics(output_path: str) -> list[dict]:
+    """Carga clínicas ya guardadas en un Excel existente."""
+    if not os.path.exists(output_path):
+        return []
+
+    try:
+        wb = load_workbook(output_path, read_only=True)
+    except Exception as e:
+        print(f"[AVISO] No se pudo leer el Excel existente ({e}). Se creará uno nuevo.")
+        return []
+
+    if "Clínicas - Prospectos" not in wb.sheetnames:
+        wb.close()
+        return []
+
+    ws = wb["Clínicas - Prospectos"]
+    clinics = []
+
+    for row_idx, row in enumerate(ws.iter_rows(min_row=2, values_only=True), 2):
+        if not row or not row[0]:
+            continue
+        clinics.append({
+            "nombre": row[0] or "",
+            "telefono": row[1] or "",
+            "email": row[2] or "",
+            "direccion": row[3] or "",
+            "web": row[4] or "",
+            "google_maps": row[5] or "",
+            "calidad_web": row[6] or "",
+            "descripcion_web": row[7] or "",
+            "rating": row[8] if row[8] is not None else "",
+            "num_reviews": row[9] if row[9] is not None else "",
+            "oportunidad": (row[10] or "").upper() == "SÍ",
+        })
+
+    wb.close()
+    return clinics
+
+
+def merge_clinics(existing: list[dict], new: list[dict]) -> tuple[list[dict], int, int]:
+    """
+    Fusiona clínicas existentes con nuevas, sin duplicar.
+    Retorna (lista_final, num_nuevas_añadidas, num_duplicadas_ignoradas).
+    """
+    seen_keys = set()
+    for clinic in existing:
+        seen_keys.add(_clinic_key(clinic["nombre"], clinic["direccion"]))
+
+    merged = list(existing)
+    added = 0
+    skipped = 0
+
+    for clinic in new:
+        key = _clinic_key(clinic["nombre"], clinic["direccion"])
+        if key in seen_keys:
+            skipped += 1
+        else:
+            seen_keys.add(key)
+            merged.append(clinic)
+            added += 1
+
+    return merged, added, skipped
+
+
 def save_to_excel(clinics: list[dict], output_path: str):
     """Guarda los resultados en un archivo Excel con formato profesional."""
     wb = Workbook()
@@ -310,7 +380,6 @@ def save_to_excel(clinics: list[dict], output_path: str):
     header_fill = PatternFill(start_color="1F4E79", end_color="1F4E79", fill_type="solid")
     header_font = Font(name="Calibri", size=11, bold=True, color="FFFFFF")
     oportunidad_fill = PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="solid")
-    no_oportunidad_fill = PatternFill(start_color="F2F2F2", end_color="F2F2F2", fill_type="solid")
     thin_border = Border(
         left=Side(style="thin"),
         right=Side(style="thin"),
@@ -360,6 +429,8 @@ def save_to_excel(clinics: list[dict], output_path: str):
 
     ws.freeze_panes = "A2"
 
+    if "Resumen" in wb.sheetnames:
+        del wb["Resumen"]
     ws_stats = wb.create_sheet("Resumen")
     stats_header_font = Font(name="Calibri", size=12, bold=True)
     stats_data = [
@@ -430,17 +501,34 @@ def main():
                 place = futures[future]
                 print(f"      [{i}/{len(places)}] ✗ Error procesando {place.get('name', '?')}: {e}")
 
-    print(f"\n[3/3] Guardando resultados en {args.output}...")
-    save_to_excel(clinics, args.output)
+    existing_clinics = load_existing_clinics(args.output)
+    if existing_clinics:
+        print(f"\n[3/4] Archivo '{args.output}' ya existe con {len(existing_clinics)} clínicas. Fusionando...")
+        all_clinics, added, skipped = merge_clinics(existing_clinics, clinics)
+        print(f"      → {added} clínicas nuevas añadidas")
+        print(f"      → {skipped} duplicadas ignoradas")
+        step_save = "[4/4]"
+    else:
+        all_clinics = clinics
+        added = len(clinics)
+        skipped = 0
+        step_save = "[3/3]"
 
-    oportunidades = sum(1 for c in clinics if c["oportunidad"])
-    sin_web = sum(1 for c in clinics if c["calidad_web"] == "Sin web")
-    basica = sum(1 for c in clinics if "BÁSICA" in c["calidad_web"])
+    print(f"\n{step_save} Guardando resultados en {args.output}...")
+    save_to_excel(all_clinics, args.output)
+
+    oportunidades = sum(1 for c in all_clinics if c["oportunidad"])
+    sin_web = sum(1 for c in all_clinics if c["calidad_web"] == "Sin web")
+    basica = sum(1 for c in all_clinics if "BÁSICA" in c["calidad_web"])
 
     print("\n" + "=" * 60)
     print("  RESUMEN")
     print("=" * 60)
-    print(f"  Total clínicas:       {len(clinics)}")
+    print(f"  Total clínicas:       {len(all_clinics)}")
+    if existing_clinics:
+        print(f"    (existentes:        {len(existing_clinics)})")
+        print(f"    (nuevas añadidas:   {added})")
+        print(f"    (duplicadas:        {skipped})")
     print(f"  Sin web:              {sin_web}")
     print(f"  Web básica:           {basica}")
     print(f"  OPORTUNIDADES:        {oportunidades}")
