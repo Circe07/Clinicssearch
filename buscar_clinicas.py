@@ -16,7 +16,6 @@ import argparse
 import os
 import re
 import sys
-import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import urlparse
 
@@ -26,8 +25,20 @@ from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 
-GOOGLE_PLACES_TEXT_SEARCH_URL = "https://maps.googleapis.com/maps/api/place/textsearch/json"
-GOOGLE_PLACES_DETAIL_URL = "https://maps.googleapis.com/maps/api/place/details/json"
+PLACES_TEXT_SEARCH_URL = "https://places.googleapis.com/v1/places:searchText"
+
+SEARCH_FIELD_MASK = ",".join([
+    "places.id",
+    "places.displayName",
+    "places.formattedAddress",
+    "places.nationalPhoneNumber",
+    "places.internationalPhoneNumber",
+    "places.websiteUri",
+    "places.googleMapsUri",
+    "places.rating",
+    "places.userRatingCount",
+    "nextPageToken",
+])
 
 HEADERS_BROWSER = {
     "User-Agent": (
@@ -94,46 +105,51 @@ def parse_args():
 
 
 def search_places(query: str, api_key: str, max_results: int = 60) -> list[dict]:
-    """Busca lugares con Google Places Text Search API (con paginación)."""
+    """Busca lugares con Google Places API (New) Text Search (con paginación)."""
     results = []
-    params = {"query": query, "key": api_key, "language": "es"}
+    headers = {
+        "Content-Type": "application/json",
+        "X-Goog-Api-Key": api_key,
+        "X-Goog-FieldMask": SEARCH_FIELD_MASK,
+    }
+    page_size = min(max_results, 20)
+    body = {
+        "textQuery": query,
+        "languageCode": "es",
+        "pageSize": page_size,
+    }
 
     while len(results) < max_results:
-        resp = requests.get(GOOGLE_PLACES_TEXT_SEARCH_URL, params=params, timeout=15)
-        data = resp.json()
+        resp = requests.post(PLACES_TEXT_SEARCH_URL, headers=headers, json=body, timeout=15)
 
-        if data.get("status") not in ("OK", "ZERO_RESULTS"):
-            print(f"[ERROR] Google Places API: {data.get('status')} - {data.get('error_message', '')}")
-            if data.get("status") == "REQUEST_DENIED":
-                print("        Verifica que tu API key sea válida y tenga habilitada la Places API.")
+        if resp.status_code != 200:
+            error_data = resp.json() if resp.headers.get("content-type", "").startswith("application/json") else {}
+            error_msg = error_data.get("error", {}).get("message", resp.text[:200])
+            error_status = error_data.get("error", {}).get("status", resp.status_code)
+            print(f"[ERROR] Google Places API: {error_status} - {error_msg}")
+            if resp.status_code == 403 or "API_KEY" in str(error_msg).upper():
+                print("        Verifica que tu API key sea válida y tenga habilitada la 'Places API (New)'.")
+                print("        En Google Cloud Console > APIs y servicios > habilita 'Places API (New)'.")
             break
 
-        results.extend(data.get("results", []))
-        next_token = data.get("next_page_token")
+        data = resp.json()
+        places = data.get("places", [])
+        if not places:
+            break
+
+        results.extend(places)
+        next_token = data.get("nextPageToken")
         if not next_token or len(results) >= max_results:
             break
 
-        time.sleep(2)
-        params = {"pagetoken": next_token, "key": api_key}
+        body = {
+            "textQuery": query,
+            "languageCode": "es",
+            "pageSize": page_size,
+            "pageToken": next_token,
+        }
 
     return results[:max_results]
-
-
-def get_place_details(place_id: str, api_key: str) -> dict:
-    """Obtiene detalles completos de un lugar (teléfono, web, etc.)."""
-    fields = "name,formatted_address,formatted_phone_number,international_phone_number,website,url,types,opening_hours,rating,user_ratings_total"
-    params = {
-        "place_id": place_id,
-        "fields": fields,
-        "key": api_key,
-        "language": "es",
-    }
-    resp = requests.get(GOOGLE_PLACES_DETAIL_URL, params=params, timeout=15)
-    data = resp.json()
-
-    if data.get("status") != "OK":
-        return {}
-    return data.get("result", {})
 
 
 def extract_emails_from_html(html: str) -> list[str]:
@@ -252,21 +268,16 @@ def analyze_website(url: str) -> dict:
     return result
 
 
-def process_clinic(place: dict, api_key: str) -> dict:
-    """Procesa una clínica: obtiene detalles y analiza su web."""
-    place_id = place.get("place_id", "")
-    basic_name = place.get("name", "Sin nombre")
-    basic_address = place.get("formatted_address", "")
-
-    details = get_place_details(place_id, api_key) if place_id else {}
-
-    name = details.get("name", basic_name)
-    address = details.get("formatted_address", basic_address)
-    phone = details.get("formatted_phone_number", "") or details.get("international_phone_number", "")
-    website = details.get("website", "")
-    google_maps_url = details.get("url", "")
-    rating = details.get("rating", "")
-    total_ratings = details.get("user_ratings_total", "")
+def process_clinic(place: dict) -> dict:
+    """Procesa una clínica: extrae datos y analiza su web."""
+    display_name = place.get("displayName", {})
+    name = display_name.get("text", "Sin nombre") if isinstance(display_name, dict) else str(display_name)
+    address = place.get("formattedAddress", "")
+    phone = place.get("nationalPhoneNumber", "") or place.get("internationalPhoneNumber", "")
+    website = place.get("websiteUri", "")
+    google_maps_url = place.get("googleMapsUri", "")
+    rating = place.get("rating", "")
+    total_ratings = place.get("userRatingCount", "")
 
     web_analysis = analyze_website(website)
 
@@ -484,11 +495,11 @@ def main():
 
     print(f"      Se encontraron {len(places)} clínicas.")
 
-    print(f"\n[2/3] Obteniendo detalles y analizando webs ({args.workers} hilos)...")
+    print(f"\n[2/3] Analizando webs de las clínicas ({args.workers} hilos)...")
     clinics = []
     with ThreadPoolExecutor(max_workers=args.workers) as executor:
         futures = {
-            executor.submit(process_clinic, place, args.api_key): place
+            executor.submit(process_clinic, place): place
             for place in places
         }
         for i, future in enumerate(as_completed(futures), 1):
@@ -499,7 +510,9 @@ def main():
                 print(f"      [{i}/{len(places)}] {status} - {clinic['nombre'][:50]} ({clinic['calidad_web']})")
             except Exception as e:
                 place = futures[future]
-                print(f"      [{i}/{len(places)}] ✗ Error procesando {place.get('name', '?')}: {e}")
+                place_name = place.get("displayName", {})
+                place_name = place_name.get("text", "?") if isinstance(place_name, dict) else "?"
+                print(f"      [{i}/{len(places)}] ✗ Error procesando {place_name}: {e}")
 
     existing_clinics = load_existing_clinics(args.output)
     if existing_clinics:
