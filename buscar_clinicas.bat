@@ -1,6 +1,7 @@
 @echo off
+setlocal enabledelayedexpansion
 chcp 65001 >nul 2>&1
-title Buscador de Clínicas - Detector de Oportunidades Web
+title Buscador de Clinicas - Detector de Oportunidades Web
 color 0A
 
 echo.
@@ -9,39 +10,32 @@ echo   BUSCADOR DE CLINICAS - Detector de Oportunidades Web
 echo ============================================================
 echo.
 
-:: Archivo donde se guarda la API key para no pedirla cada vez
 set "CONFIG_FILE=%~dp0.api_key"
 
-:: Comprobar si ya existe una API key guardada
-if exist "%CONFIG_FILE%" (
-    set /p API_KEY=<"%CONFIG_FILE%"
+if exist "!CONFIG_FILE!" (
+    set /p API_KEY=<"!CONFIG_FILE!"
     echo   API key encontrada. Usando la guardada.
-    echo   ^(Para cambiarla, borra el archivo .api_key^)
+    echo   Para cambiarla, borra el archivo .api_key
     echo.
-) else (
-    echo   Primera vez? Necesitas tu API key de Google Places.
-    echo   ^(Solo se pide una vez, se guarda para futuras ejecuciones^)
-    echo.
-    set /p API_KEY="   Introduce tu API key de Google Places: "
-    if "!API_KEY!"=="" (
-        echo.
-        echo   [ERROR] No has introducido ninguna API key.
-        pause
-        exit /b 1
-    )
-    echo !API_KEY!>"%CONFIG_FILE%"
-    echo.
-    echo   API key guardada correctamente.
-    echo.
+    goto MENU
 )
 
-:: Habilitar expansión retardada después de leer la key
-setlocal enabledelayedexpansion
+echo   Primera vez? Necesitas tu API key de Google Places.
+echo   Solo se pide una vez, se guarda para futuras ejecuciones.
+echo.
+set /p "API_KEY=   Introduce tu API key de Google Places: "
 
-:: Re-leer la API key con expansión retardada habilitada
-if exist "%CONFIG_FILE%" (
-    set /p API_KEY=<"%CONFIG_FILE%"
+if "!API_KEY!"=="" (
+    echo.
+    echo   [ERROR] No has introducido ninguna API key.
+    pause
+    exit /b 1
 )
+
+echo !API_KEY!>"!CONFIG_FILE!"
+echo.
+echo   API key guardada correctamente.
+echo.
 
 :MENU
 echo.
@@ -56,7 +50,9 @@ echo     - fisioterapia en Valencia
 echo     - veterinarias en Sevilla
 echo     - podologia en Bilbao
 echo.
-set /p QUERY="   Tu busqueda: "
+
+set "QUERY="
+set /p "QUERY=   Tu busqueda: "
 
 if "!QUERY!"=="" (
     echo.
@@ -64,8 +60,9 @@ if "!QUERY!"=="" (
     goto MENU
 )
 
+set "OUTPUT="
 echo.
-set /p OUTPUT="   Nombre del archivo Excel (Enter = clinicas_prospecto.xlsx): "
+set /p "OUTPUT=   Nombre del archivo Excel (Enter = clinicas_prospecto.xlsx): "
 if "!OUTPUT!"=="" set "OUTPUT=clinicas_prospecto.xlsx"
 
 echo.
@@ -78,7 +75,7 @@ echo.
 
 python buscar_clinicas.py -k "!API_KEY!" -q "!QUERY!" -o "!OUTPUT!"
 
-if %ERRORLEVEL% neq 0 (
+if !ERRORLEVEL! neq 0 (
     echo.
     echo   [ERROR] Algo fallo. Revisa los mensajes de arriba.
     echo   Si el error es de API key, borra el archivo .api_key y ejecuta de nuevo.
@@ -86,8 +83,11 @@ if %ERRORLEVEL% neq 0 (
 
 echo.
 echo ============================================================
-set /p OTRA="   Quieres hacer otra busqueda? (s/n): "
+
+set "OTRA="
+set /p "OTRA=   Quieres hacer otra busqueda? (s/n): "
 if /i "!OTRA!"=="s" goto MENU
+if /i "!OTRA!"=="si" goto MENU
 
 echo.
 echo   Hasta luego!
