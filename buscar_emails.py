@@ -5,12 +5,14 @@ Buscador avanzado de emails para clínicas.
 Lee el Excel generado por buscar_clinicas.py, identifica las clínicas
 sin email, y usa múltiples estrategias para encontrar sus correos:
 
-  1. Rastreo profundo de toda la web (todas las páginas internas)
-  2. Extracción de mailto: links y datos estructurados (JSON-LD / schema.org)
-  3. Búsqueda en Google: "nombre clínica" + "email" / "@"
-  4. Búsqueda en directorios españoles (Doctoralia, Páginas Amarillas, etc.)
-  5. Adivinación de patrones (info@, contacto@, clinica@) + verificación SMTP/MX
-  6. Redes sociales (Facebook about page)
+  1. Rastreo profundo de toda la web (hasta 40 páginas, emails ofuscados)
+  2. Extracción de mailto:, JSON-LD, schema.org, meta tags
+  3. Adivinación de patrones + verificación SMTP (todos los prefijos)
+  4. Búsqueda en Google, DuckDuckGo y Bing
+  5. Directorios: Doctoralia, Páginas Amarillas, TopDoctors, 11870, Cylex
+  6. Redes sociales (Facebook, Instagram bio)
+  7. Google Maps (ficha de la clínica)
+  8. WHOIS del dominio
 
 Uso:
     python buscar_emails.py
@@ -24,8 +26,9 @@ import re
 import smtplib
 import socket
 import sys
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from urllib.parse import urljoin, urlparse
+from urllib.parse import quote_plus, urljoin, urlparse
 
 import dns.resolver
 import requests
@@ -48,6 +51,12 @@ HEADERS_BROWSER = {
 
 EMAIL_REGEX = re.compile(r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}")
 
+OBFUSCATED_PATTERNS = [
+    re.compile(r"([a-zA-Z0-9._%+\-]+)\s*[\[\(]\s*(?:arroba|at|@)\s*[\]\)]\s*([a-zA-Z0-9.\-]+)\s*[\[\(]\s*(?:punto|dot|\.)\s*[\]\)]\s*([a-zA-Z]{2,})", re.IGNORECASE),
+    re.compile(r"([a-zA-Z0-9._%+\-]+)\s*(?:arroba|ARROBA)\s*([a-zA-Z0-9.\-]+)\s*(?:punto|PUNTO)\s*([a-zA-Z]{2,})", re.IGNORECASE),
+    re.compile(r"([a-zA-Z0-9._%+\-]+)\s*\[at\]\s*([a-zA-Z0-9.\-]+)\s*\[dot\]\s*([a-zA-Z]{2,})", re.IGNORECASE),
+]
+
 JUNK_EXTENSIONS = (
     ".png", ".jpg", ".jpeg", ".gif", ".svg", ".webp",
     ".css", ".js", ".woff", ".woff2", ".ttf", ".ico",
@@ -60,35 +69,29 @@ JUNK_DOMAINS = (
     "instagram.com", "youtube.com", "linkedin.com",
     "cookiebot.com", "cookielaw.com", "onetrust.com",
     "cloudflare.com", "gstatic.com", "google.com",
-    "wixpress.com", "squarespace.com", "sentry-next.wixpress.com",
+    "wixpress.com", "squarespace.com", "wix.com",
+    "hotjar.com", "hubspot.com", "mailchimp.com",
+    "jsdelivr.net", "unpkg.com", "cdnjs.com",
 )
 
 CONTACT_KEYWORDS = [
-    "contacto", "contact", "contacta", "contacte", "kontakt",
+    "contacto", "contact", "contacta", "contacte",
     "sobre-nosotros", "about", "quienes-somos", "quien-somos",
-    "aviso-legal", "legal", "aviso_legal", "legal-notice",
+    "aviso-legal", "legal", "aviso_legal",
     "politica-de-privacidad", "privacidad", "privacy",
     "equipo", "team", "staff", "profesionales",
     "informacion", "info",
-    "cita", "appointment", "pedir-cita", "reservar", "reserva",
-    "donde-estamos", "ubicacion", "como-llegar", "localizacion",
-    "impressum", "imprint",
-    "pie-de-pagina", "footer",
+    "cita", "appointment", "pedir-cita", "reservar",
+    "donde-estamos", "ubicacion", "como-llegar",
+    "impressum", "imprint", "footer",
+    "empresa", "nosotros", "clinica",
 ]
 
 EMAIL_PREFIXES = [
     "info", "contacto", "contact", "clinica", "recepcion",
     "administracion", "admin", "hola", "consulta", "consultas",
     "citas", "atencion", "secretaria", "gerencia", "direccion",
-]
-
-DIRECTORY_SEARCH_TEMPLATES = [
-    "site:doctoralia.es {name}",
-    "site:topdoctors.es {name}",
-    "site:paginasamarillas.es {name}",
-    "site:yelp.es {name}",
-    '"{name}" "{city}" email OR correo OR "@"',
-    '"{name}" "{city}" arroba',
+    "recepcio", "consultes", "clínica",
 ]
 
 # ---------------------------------------------------------------------------
@@ -126,11 +129,14 @@ def clean_emails(raw_emails: list[str]) -> list[str]:
             continue
         if any(domain in lower for domain in JUNK_DOMAINS):
             continue
-        if len(lower) > 60:
+        if len(lower) > 60 or len(lower) < 5:
             continue
-        if lower.startswith("noreply") or lower.startswith("no-reply"):
+        if lower.startswith(("noreply", "no-reply", "mailer-daemon", "postmaster")):
             continue
         if lower.count("@") != 1:
+            continue
+        domain_part = lower.split("@")[1]
+        if "." not in domain_part:
             continue
         seen.add(lower)
         cleaned.append(email)
@@ -163,26 +169,163 @@ def fetch_page(url: str, timeout: int = 10) -> str | None:
         return None
 
 
-def google_search(query: str, num_results: int = 5) -> list[str]:
-    """Busca en Google y devuelve las URLs de los resultados."""
-    url = "https://www.google.com/search"
-    params = {"q": query, "num": num_results, "hl": "es"}
-    headers = {**HEADERS_BROWSER, "Referer": "https://www.google.com/"}
+def extract_emails_from_html(html: str) -> list[str]:
+    """Extrae emails del HTML: regex, mailto, ofuscados, JSON-LD, schema.org."""
+    emails = []
+
+    emails.extend(EMAIL_REGEX.findall(html))
+
+    for pattern in OBFUSCATED_PATTERNS:
+        for match in pattern.finditer(html):
+            email = f"{match.group(1)}@{match.group(2)}.{match.group(3)}"
+            emails.append(email)
+
+    soup = BeautifulSoup(html, "html.parser")
+
+    for a_tag in soup.find_all("a", href=True):
+        href = a_tag["href"]
+        if href.startswith("mailto:"):
+            email = href.replace("mailto:", "").split("?")[0].strip()
+            if EMAIL_REGEX.match(email):
+                emails.append(email)
+
+    for script in soup.find_all("script", type="application/ld+json"):
+        try:
+            data = json.loads(script.string or "")
+            emails.extend(_extract_emails_jsonld(data))
+        except (json.JSONDecodeError, TypeError):
+            pass
+
+    for tag in soup.find_all(attrs={"itemprop": "email"}):
+        content = tag.get("content", "") or tag.get_text(strip=True)
+        if EMAIL_REGEX.match(content):
+            emails.append(content)
+
+    for meta in soup.find_all("meta"):
+        content = meta.get("content", "")
+        if "@" in content:
+            emails.extend(EMAIL_REGEX.findall(content))
+
+    return emails
+
+
+def _extract_emails_jsonld(data) -> list[str]:
+    """Recorre recursivamente JSON-LD buscando emails."""
+    emails = []
+    if isinstance(data, dict):
+        for key, value in data.items():
+            if key.lower() in ("email", "contactpoint", "contactpoints"):
+                if isinstance(value, str) and EMAIL_REGEX.match(value):
+                    emails.append(value)
+                elif isinstance(value, (list, dict)):
+                    emails.extend(_extract_emails_jsonld(value))
+            else:
+                emails.extend(_extract_emails_jsonld(value))
+    elif isinstance(data, list):
+        for item in data:
+            emails.extend(_extract_emails_jsonld(item))
+    return emails
+
+
+# ---------------------------------------------------------------------------
+# Search engines
+# ---------------------------------------------------------------------------
+
+
+def _search_google(query: str, num: int = 5) -> list[str]:
+    """Google search, devuelve URLs."""
     try:
-        resp = requests.get(url, params=params, headers=headers, timeout=10)
+        resp = requests.get(
+            "https://www.google.com/search",
+            params={"q": query, "num": num, "hl": "es"},
+            headers={**HEADERS_BROWSER, "Referer": "https://www.google.com/"},
+            timeout=10,
+        )
         if resp.status_code != 200:
             return []
-        soup = BeautifulSoup(resp.text, "html.parser")
         urls = []
-        for a_tag in soup.find_all("a", href=True):
-            href = a_tag["href"]
+        for a in BeautifulSoup(resp.text, "html.parser").find_all("a", href=True):
+            href = a["href"]
             if href.startswith("/url?q="):
-                real_url = href.split("/url?q=")[1].split("&")[0]
-                if real_url.startswith("http") and "google." not in real_url:
-                    urls.append(real_url)
-        return urls[:num_results]
+                real = href.split("/url?q=")[1].split("&")[0]
+                if real.startswith("http") and "google." not in real:
+                    urls.append(real)
+        return urls[:num]
     except Exception:
         return []
+
+
+def _search_duckduckgo(query: str, num: int = 5) -> list[str]:
+    """DuckDuckGo HTML search, devuelve URLs."""
+    try:
+        resp = requests.get(
+            "https://html.duckduckgo.com/html/",
+            params={"q": query},
+            headers=HEADERS_BROWSER,
+            timeout=10,
+        )
+        if resp.status_code != 200:
+            return []
+        urls = []
+        soup = BeautifulSoup(resp.text, "html.parser")
+        for a in soup.find_all("a", class_="result__a", href=True):
+            href = a["href"]
+            if href.startswith("http"):
+                urls.append(href)
+        return urls[:num]
+    except Exception:
+        return []
+
+
+def _search_bing(query: str, num: int = 5) -> list[str]:
+    """Bing search, devuelve URLs."""
+    try:
+        resp = requests.get(
+            "https://www.bing.com/search",
+            params={"q": query, "count": num},
+            headers=HEADERS_BROWSER,
+            timeout=10,
+        )
+        if resp.status_code != 200:
+            return []
+        urls = []
+        soup = BeautifulSoup(resp.text, "html.parser")
+        for li in soup.find_all("li", class_="b_algo"):
+            a = li.find("a", href=True)
+            if a and a["href"].startswith("http"):
+                urls.append(a["href"])
+        return urls[:num]
+    except Exception:
+        return []
+
+
+def multi_search(query: str, num: int = 5) -> list[str]:
+    """Busca en Google, DuckDuckGo y Bing. Combina resultados."""
+    seen = set()
+    results = []
+    for search_fn in [_search_google, _search_duckduckgo, _search_bing]:
+        for url in search_fn(query, num):
+            if url not in seen:
+                seen.add(url)
+                results.append(url)
+        if len(results) >= num:
+            break
+    return results[:num * 2]
+
+
+def search_and_extract_emails(query: str, max_pages: int = 5) -> list[str]:
+    """Busca en buscadores y extrae emails de las páginas resultantes."""
+    emails = []
+    urls = multi_search(query, num=max_pages)
+    for url in urls[:max_pages]:
+        html = fetch_page(url, timeout=8)
+        if not html:
+            continue
+        found = extract_emails_from_html(html)
+        emails.extend(found)
+        if clean_emails(emails):
+            break
+    return clean_emails(emails)
 
 
 # ---------------------------------------------------------------------------
@@ -190,12 +333,8 @@ def google_search(query: str, num_results: int = 5) -> list[str]:
 # ---------------------------------------------------------------------------
 
 
-def crawl_website(base_url: str, max_pages: int = 25) -> tuple[list[str], list[str]]:
-    """
-    Rastrea todo el sitio web buscando emails.
-    Prioriza páginas de contacto, luego el resto.
-    Retorna (emails, pages_visited).
-    """
+def crawl_website(base_url: str, max_pages: int = 40) -> tuple[list[str], list[str]]:
+    """Rastrea todo el sitio web buscando emails. Prioriza contacto."""
     if not base_url:
         return [], []
 
@@ -237,6 +376,7 @@ def crawl_website(base_url: str, max_pages: int = 25) -> tuple[list[str], list[s
         clean_url = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
         if clean_url in visited:
             continue
+        visited.add(clean_url)
 
         path_lower = parsed.path.lower()
         link_text = a_tag.get_text(strip=True).lower()
@@ -246,7 +386,6 @@ def crawl_website(base_url: str, max_pages: int = 25) -> tuple[list[str], list[s
             priority_queue.append(clean_url)
         else:
             normal_queue.append(clean_url)
-        visited.add(clean_url)
 
     for url in priority_queue + normal_queue:
         if len(pages_visited) >= max_pages:
@@ -255,123 +394,19 @@ def crawl_website(base_url: str, max_pages: int = 25) -> tuple[list[str], list[s
         if not html:
             continue
         pages_visited.append(url)
-        all_emails.extend(extract_emails_from_html(html))
+        page_emails = extract_emails_from_html(html)
+        all_emails.extend(page_emails)
 
     return clean_emails(all_emails), pages_visited
 
 
-def extract_emails_from_html(html: str) -> list[str]:
-    """Extrae emails del HTML: regex + mailto + JSON-LD + schema.org."""
-    emails = []
-
-    emails.extend(EMAIL_REGEX.findall(html))
-
-    soup = BeautifulSoup(html, "html.parser")
-
-    for a_tag in soup.find_all("a", href=True):
-        href = a_tag["href"]
-        if href.startswith("mailto:"):
-            email = href.replace("mailto:", "").split("?")[0].strip()
-            if EMAIL_REGEX.match(email):
-                emails.append(email)
-
-    for script in soup.find_all("script", type="application/ld+json"):
-        try:
-            data = json.loads(script.string or "")
-            emails.extend(extract_emails_from_jsonld(data))
-        except (json.JSONDecodeError, TypeError):
-            pass
-
-    for tag in soup.find_all(attrs={"itemprop": "email"}):
-        content = tag.get("content", "") or tag.get_text(strip=True)
-        if EMAIL_REGEX.match(content):
-            emails.append(content)
-
-    return emails
-
-
-def extract_emails_from_jsonld(data) -> list[str]:
-    """Recorre recursivamente JSON-LD buscando campos de email."""
-    emails = []
-    if isinstance(data, dict):
-        for key, value in data.items():
-            if key.lower() in ("email", "contactpoint", "contactpoints"):
-                if isinstance(value, str) and EMAIL_REGEX.match(value):
-                    emails.append(value)
-                elif isinstance(value, (list, dict)):
-                    emails.extend(extract_emails_from_jsonld(value))
-            else:
-                emails.extend(extract_emails_from_jsonld(value))
-    elif isinstance(data, list):
-        for item in data:
-            emails.extend(extract_emails_from_jsonld(item))
-    return emails
-
-
 # ---------------------------------------------------------------------------
-# Strategy 2: Google Search
-# ---------------------------------------------------------------------------
-
-
-def search_email_google(name: str, city: str) -> list[str]:
-    """Busca el email de una clínica en Google."""
-    emails = []
-
-    queries = [
-        f'"{name}" email OR correo OR "@"',
-        f'"{name}" "{city}" email',
-    ]
-
-    for query in queries:
-        urls = google_search(query, num_results=5)
-        for url in urls[:3]:
-            html = fetch_page(url, timeout=8)
-            if not html:
-                continue
-            found = EMAIL_REGEX.findall(html)
-            emails.extend(found)
-        if clean_emails(emails):
-            break
-
-    return clean_emails(emails)
-
-
-# ---------------------------------------------------------------------------
-# Strategy 3: Spanish directories
-# ---------------------------------------------------------------------------
-
-
-def search_directories(name: str, city: str) -> list[str]:
-    """Busca emails en directorios españoles."""
-    emails = []
-
-    direct_urls = []
-
-    slug = name.lower().replace(" ", "-").replace(".", "")
-    slug = re.sub(r"[^a-z0-9\-]", "", slug)
-
-    doctoralia_queries = [f"site:doctoralia.es \"{name}\""]
-    for q in doctoralia_queries:
-        urls = google_search(q, num_results=3)
-        direct_urls.extend(urls)
-
-    for url in direct_urls[:5]:
-        html = fetch_page(url, timeout=8)
-        if not html:
-            continue
-        found = EMAIL_REGEX.findall(html)
-        emails.extend(found)
-
-    return clean_emails(emails)
-
-
-# ---------------------------------------------------------------------------
-# Strategy 4: Email pattern guessing + MX/SMTP verify
+# Strategy 2: Email pattern guessing + SMTP verify
 # ---------------------------------------------------------------------------
 
 
 def get_domain_from_web(web_url: str) -> str | None:
-    """Extrae el dominio raíz de una URL de web."""
+    """Extrae el dominio raíz de una URL."""
     if not web_url:
         return None
     parsed = urlparse(web_url)
@@ -382,7 +417,7 @@ def get_domain_from_web(web_url: str) -> str | None:
 
 
 def check_mx_exists(domain: str) -> bool:
-    """Verifica si un dominio tiene registros MX (acepta correo)."""
+    """Verifica si un dominio tiene registros MX."""
     try:
         dns.resolver.resolve(domain, "MX")
         return True
@@ -390,32 +425,29 @@ def check_mx_exists(domain: str) -> bool:
         return False
 
 
-def verify_email_smtp(email: str) -> bool | None:
+def verify_email_smtp(email: str, mx_host: str) -> bool | None:
     """
-    Verifica si un email existe via SMTP (sin enviar correo).
+    Verifica si un email existe via SMTP.
     Retorna True (existe), False (no existe), None (no se pudo verificar).
     """
-    domain = email.split("@")[1]
-    try:
-        records = dns.resolver.resolve(domain, "MX")
-        mx_host = str(records[0].exchange).rstrip(".")
-    except Exception:
-        return None
-
     try:
         smtp = smtplib.SMTP(timeout=5)
         smtp.connect(mx_host, 25)
-        smtp.helo("verificador.local")
-        smtp.mail("test@verificador.local")
+        smtp.helo("check.local")
+        smtp.mail("test@check.local")
         code, _ = smtp.rcpt(email)
         smtp.quit()
-        return code == 250
+        if code == 250:
+            return True
+        elif code == 550 or code == 551 or code == 553:
+            return False
+        return None
     except Exception:
         return None
 
 
 def guess_and_verify_emails(web_url: str) -> list[str]:
-    """Genera emails probables y verifica cuáles existen."""
+    """Genera emails probables y verifica cuáles existen via SMTP."""
     domain = get_domain_from_web(web_url)
     if not domain:
         return []
@@ -423,56 +455,220 @@ def guess_and_verify_emails(web_url: str) -> list[str]:
     if not check_mx_exists(domain):
         return []
 
+    try:
+        records = dns.resolver.resolve(domain, "MX")
+        mx_host = str(records[0].exchange).rstrip(".")
+    except Exception:
+        return []
+
     verified = []
+    catch_all = None
+
     for prefix in EMAIL_PREFIXES:
         candidate = f"{prefix}@{domain}"
-        result = verify_email_smtp(candidate)
+        result = verify_email_smtp(candidate, mx_host)
         if result is True:
             verified.append(candidate)
-            break
-        elif result is None:
-            verified.append(candidate)
-            break
+            if len(verified) >= 3:
+                catch_all = True
+                break
+        elif result is False:
+            continue
 
-    return verified
+    if catch_all:
+        return [f"info@{domain}"]
+
+    if not verified:
+        random_test = f"xq9z8w7test@{domain}"
+        result = verify_email_smtp(random_test, mx_host)
+        if result is True:
+            return [f"info@{domain}"]
+
+    return verified[:2]
 
 
 # ---------------------------------------------------------------------------
-# Strategy 5: Social media (Facebook)
+# Strategy 3: Search engines
 # ---------------------------------------------------------------------------
 
 
-def find_facebook_email(html: str, base_url: str) -> list[str]:
-    """Busca la página de Facebook y extrae el email si está visible."""
+def search_email_engines(name: str, city: str) -> list[str]:
+    """Busca el email con múltiples buscadores y consultas."""
+    queries = [
+        f'"{name}" correo OR email OR "@"',
+    ]
+    if city:
+        queries.append(f'"{name}" "{city}" email')
+
+    for query in queries:
+        emails = search_and_extract_emails(query, max_pages=4)
+        if emails:
+            return emails
+    return []
+
+
+# ---------------------------------------------------------------------------
+# Strategy 4: Spanish directories (direct scrape)
+# ---------------------------------------------------------------------------
+
+
+DIRECTORY_SEARCHES = [
+    'site:doctoralia.es "{name}"',
+    'site:topdoctors.es "{name}"',
+    'site:paginasamarillas.es "{name}"',
+    'site:11870.com "{name}"',
+    'site:cylex.es "{name}"',
+    'site:infoisinfo.es "{name}"',
+    'site:clinicasesteticas.com "{name}"',
+]
+
+
+def search_directories(name: str, city: str) -> list[str]:
+    """Busca en directorios españoles vía buscadores."""
+    all_emails = []
+
+    for template in DIRECTORY_SEARCHES:
+        query = template.format(name=name)
+        urls = multi_search(query, num=3)
+        for url in urls[:2]:
+            html = fetch_page(url, timeout=8)
+            if not html:
+                continue
+            found = extract_emails_from_html(html)
+            cleaned = clean_emails(found)
+            if cleaned:
+                return cleaned
+
+    return clean_emails(all_emails)
+
+
+# ---------------------------------------------------------------------------
+# Strategy 5: Social media
+# ---------------------------------------------------------------------------
+
+
+def find_social_email(html: str) -> list[str]:
+    """Busca emails en páginas de redes sociales enlazadas."""
     soup = BeautifulSoup(html, "html.parser")
-    fb_urls = []
+    social_urls = []
 
     for a_tag in soup.find_all("a", href=True):
         href = a_tag["href"]
         if "facebook.com" in href and "/posts/" not in href and "/photos/" not in href:
-            fb_urls.append(href)
+            social_urls.append(href)
+        elif "instagram.com" in href:
+            social_urls.append(href)
 
     emails = []
-    for fb_url in fb_urls[:2]:
-        html = fetch_page(fb_url, timeout=8)
-        if not html:
+    for url in social_urls[:3]:
+        page_html = fetch_page(url, timeout=8)
+        if not page_html:
             continue
-        found = EMAIL_REGEX.findall(html)
+        found = EMAIL_REGEX.findall(page_html)
         emails.extend(found)
+        if clean_emails(emails):
+            break
 
     return clean_emails(emails)
 
 
 # ---------------------------------------------------------------------------
-# Orchestrator: run all strategies for one clinic
+# Strategy 6: Google Maps page
 # ---------------------------------------------------------------------------
 
 
-def find_email_for_clinic(name: str, web: str, address: str) -> dict:
-    """
-    Ejecuta todas las estrategias para encontrar el email de una clínica.
-    Retorna dict con resultado y detalles de cada estrategia.
-    """
+def search_google_maps_email(name: str, city: str) -> list[str]:
+    """Busca el email en la ficha de Google Maps."""
+    query = f'"{name}" {city} site:google.com/maps'
+    urls = _search_google(query, num=3)
+    emails = []
+    for url in urls[:2]:
+        html = fetch_page(url, timeout=8)
+        if not html:
+            continue
+        found = EMAIL_REGEX.findall(html)
+        emails.extend(found)
+    return clean_emails(emails)
+
+
+# ---------------------------------------------------------------------------
+# Strategy 7: Phone number search
+# ---------------------------------------------------------------------------
+
+
+def search_email_by_phone(phone: str, name: str) -> list[str]:
+    """Busca el email usando el número de teléfono en buscadores."""
+    if not phone or len(phone.strip()) < 6:
+        return []
+
+    phone_clean = phone.strip()
+    phone_digits = re.sub(r"[^\d+]", "", phone_clean)
+
+    queries = [
+        f'"{phone_clean}" email OR correo OR "@"',
+        f'"{phone_digits}" "{name}" email',
+    ]
+
+    for query in queries:
+        urls = multi_search(query, num=5)
+        emails = []
+        for url in urls[:4]:
+            html = fetch_page(url, timeout=8)
+            if not html:
+                continue
+            found = extract_emails_from_html(html)
+            emails.extend(found)
+        cleaned = clean_emails(emails)
+        if cleaned:
+            return cleaned
+
+    return []
+
+
+# ---------------------------------------------------------------------------
+# Strategy 8: WHOIS
+# ---------------------------------------------------------------------------
+
+
+def whois_email(web_url: str) -> list[str]:
+    """Intenta obtener email del WHOIS del dominio."""
+    domain = get_domain_from_web(web_url)
+    if not domain:
+        return []
+
+    try:
+        resp = requests.get(
+            f"https://whois.domaintools.com/{domain}",
+            headers=HEADERS_BROWSER,
+            timeout=8,
+        )
+        if resp.status_code != 200:
+            return []
+        found = EMAIL_REGEX.findall(resp.text)
+        return clean_emails(found)
+    except Exception:
+        return []
+
+
+# ---------------------------------------------------------------------------
+# Orchestrator
+# ---------------------------------------------------------------------------
+
+
+STRATEGY_ORDER = [
+    ("Rastreo web profundo", "crawl"),
+    ("Redes sociales", "social"),
+    ("Patrón email + SMTP", "smtp"),
+    ("Buscar por teléfono", "phone"),
+    ("Buscadores (Google/DDG/Bing)", "search"),
+    ("Directorios españoles", "directories"),
+    ("Google Maps", "gmaps"),
+    ("WHOIS", "whois"),
+]
+
+
+def find_email_for_clinic(name: str, web: str, address: str, phone: str) -> dict:
+    """Ejecuta todas las estrategias en cascada para encontrar el email."""
     result = {
         "name": name,
         "emails": [],
@@ -490,51 +686,50 @@ def find_email_for_clinic(name: str, web: str, address: str) -> dict:
                 city = cleaned
                 break
 
-    # --- Strategy 1: Deep crawl ---
-    result["strategies_tried"].append("crawl")
-    if web:
-        emails, pages = crawl_website(web, max_pages=25)
-        result["pages_crawled"] = len(pages)
+    cached_main_html = None
+
+    for strategy_name, strategy_id in STRATEGY_ORDER:
+        result["strategies_tried"].append(strategy_id)
+        emails = []
+
+        try:
+            if strategy_id == "crawl" and web:
+                emails, pages = crawl_website(web, max_pages=40)
+                result["pages_crawled"] = len(pages)
+                if not emails and pages:
+                    cached_main_html = fetch_page(web)
+
+            elif strategy_id == "social" and web:
+                html = cached_main_html or fetch_page(web)
+                if html:
+                    cached_main_html = html
+                    emails = find_social_email(html)
+
+            elif strategy_id == "smtp" and web:
+                emails = guess_and_verify_emails(web)
+
+            elif strategy_id == "phone" and phone:
+                emails = search_email_by_phone(phone, name)
+
+            elif strategy_id == "search":
+                emails = search_email_engines(name, city)
+
+            elif strategy_id == "directories":
+                emails = search_directories(name, city)
+
+            elif strategy_id == "gmaps":
+                emails = search_google_maps_email(name, city)
+
+            elif strategy_id == "whois" and web:
+                emails = whois_email(web)
+
+        except Exception:
+            continue
+
         if emails:
             result["emails"] = emails
-            result["strategy_used"] = "Rastreo web profundo"
+            result["strategy_used"] = strategy_name
             return result
-
-    # --- Strategy 2: Facebook from website ---
-    if web:
-        result["strategies_tried"].append("facebook")
-        main_html = fetch_page(web)
-        if main_html:
-            fb_emails = find_facebook_email(main_html, web)
-            if fb_emails:
-                result["emails"] = fb_emails
-                result["strategy_used"] = "Facebook"
-                return result
-
-    # --- Strategy 3: Email pattern guessing + SMTP ---
-    if web:
-        result["strategies_tried"].append("smtp_guess")
-        guessed = guess_and_verify_emails(web)
-        if guessed:
-            result["emails"] = guessed
-            result["strategy_used"] = "Patrón email verificado (SMTP)"
-            return result
-
-    # --- Strategy 4: Google search ---
-    result["strategies_tried"].append("google")
-    google_emails = search_email_google(name, city)
-    if google_emails:
-        result["emails"] = google_emails
-        result["strategy_used"] = "Búsqueda en Google"
-        return result
-
-    # --- Strategy 5: Directories ---
-    result["strategies_tried"].append("directories")
-    dir_emails = search_directories(name, city)
-    if dir_emails:
-        result["emails"] = dir_emails
-        result["strategy_used"] = "Directorios (Doctoralia, etc.)"
-        return result
 
     result["strategy_used"] = "No encontrado"
     return result
@@ -550,7 +745,7 @@ def main():
 
     print("=" * 60)
     print("  BUSCADOR AVANZADO DE EMAILS")
-    print("  Sistema multi-estrategia")
+    print("  Sistema multi-estrategia (8 métodos)")
     print("=" * 60)
 
     try:
@@ -574,6 +769,7 @@ def main():
         if not name:
             continue
         total_clinics += 1
+        phone = ws.cell(row=row_idx, column=2).value or ""
         email = ws.cell(row=row_idx, column=3).value
         address = ws.cell(row=row_idx, column=4).value or ""
 
@@ -590,6 +786,7 @@ def main():
             clinics_to_search.append({
                 "row": row_idx,
                 "name": str(name),
+                "phone": str(phone),
                 "web": web,
                 "address": str(address),
             })
@@ -599,22 +796,26 @@ def main():
     print(f"  Sin email (a buscar):       {len(clinics_to_search)}")
     sin_web = sum(1 for c in clinics_to_search if not c["web"])
     con_web = len(clinics_to_search) - sin_web
-    print(f"    - Con web (todas las estrategias): {con_web}")
-    print(f"    - Sin web (solo Google/directorios): {sin_web}")
+    con_phone = sum(1 for c in clinics_to_search if c["phone"].strip())
+    print(f"    - Con web (8 estrategias):          {con_web}")
+    print(f"    - Con teléfono:                     {con_phone}")
+    print(f"    - Sin web (teléfono/buscadores):    {sin_web}")
 
     if not clinics_to_search:
         print("\n  Todas las clínicas ya tienen email.")
         wb.close()
         sys.exit(0)
 
-    print(f"\n  Estrategias disponibles:")
-    print(f"    1. Rastreo web profundo (hasta 25 páginas por clínica)")
-    print(f"    2. Extracción mailto: + datos estructurados (JSON-LD)")
-    print(f"    3. Redes sociales (Facebook)")
-    print(f"    4. Adivinación de patrones + verificación SMTP")
-    print(f"    5. Búsqueda en Google")
-    print(f"    6. Directorios (Doctoralia, etc.)")
-    print(f"\n  Buscando emails ({args.workers} hilos)...\n")
+    print(f"\n  Estrategias (en orden):")
+    print(f"    1. Rastreo web profundo (hasta 40 págs, emails ofuscados)")
+    print(f"    2. Redes sociales (Facebook, Instagram)")
+    print(f"    3. Adivinar patrón + verificar SMTP (15 prefijos)")
+    print(f"    4. Buscar por teléfono en buscadores")
+    print(f"    5. Buscadores (Google + DuckDuckGo + Bing)")
+    print(f"    6. Directorios (Doctoralia, PáginasAmarillas, TopDoctors...)")
+    print(f"    7. Ficha de Google Maps")
+    print(f"    8. WHOIS del dominio")
+    print(f"\n  Buscando ({args.workers} hilos)...\n")
 
     found_count = 0
     not_found_count = 0
@@ -625,7 +826,7 @@ def main():
         futures = {
             executor.submit(
                 find_email_for_clinic,
-                c["name"], c["web"], c["address"]
+                c["name"], c["web"], c["address"], c["phone"]
             ): c
             for c in clinics_to_search
         }
@@ -641,23 +842,22 @@ def main():
                     strategy_stats[strategy] = strategy_stats.get(strategy, 0) + 1
                     emails_str = ", ".join(res["emails"][:3])
                     print(f"  [{i}/{len(clinics_to_search)}] ENCONTRADO  {short_name}")
-                    print(f"       Emails: {emails_str}")
-                    print(f"       Via:    {strategy}")
+                    print(f"       → {emails_str}")
+                    print(f"       Via: {strategy}")
                 else:
                     not_found_count += 1
-                    tried = ", ".join(res["strategies_tried"])
-                    print(f"  [{i}/{len(clinics_to_search)}] sin resultado  {short_name}")
-                    print(f"       Estrategias usadas: {tried} ({res['pages_crawled']} págs)")
+                    tried = len(res["strategies_tried"])
+                    print(f"  [{i}/{len(clinics_to_search)}] sin resultado  {short_name}  ({tried} estrategias, {res['pages_crawled']} págs)")
             except Exception as e:
                 not_found_count += 1
                 print(f"  [{i}/{len(clinics_to_search)}] ERROR  {clinic['name'][:40]}: {e}")
 
     if found_count > 0:
-        print(f"\n  Actualizando Excel con {found_count} emails encontrados...")
+        print(f"\n  Actualizando Excel con {found_count} emails...")
         for row_idx, emails in results.items():
             ws.cell(row=row_idx, column=3, value=", ".join(emails))
         wb.save(args.input)
-        print(f"  Excel guardado: {args.input}")
+        print(f"  Guardado: {args.input}")
     else:
         print(f"\n  No se encontraron emails nuevos.")
 
