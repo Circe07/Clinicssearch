@@ -592,7 +592,41 @@ def search_google_maps_email(name: str, city: str) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
-# Strategy 7: WHOIS
+# Strategy 7: Phone number search
+# ---------------------------------------------------------------------------
+
+
+def search_email_by_phone(phone: str, name: str) -> list[str]:
+    """Busca el email usando el número de teléfono en buscadores."""
+    if not phone or len(phone.strip()) < 6:
+        return []
+
+    phone_clean = phone.strip()
+    phone_digits = re.sub(r"[^\d+]", "", phone_clean)
+
+    queries = [
+        f'"{phone_clean}" email OR correo OR "@"',
+        f'"{phone_digits}" "{name}" email',
+    ]
+
+    for query in queries:
+        urls = multi_search(query, num=5)
+        emails = []
+        for url in urls[:4]:
+            html = fetch_page(url, timeout=8)
+            if not html:
+                continue
+            found = extract_emails_from_html(html)
+            emails.extend(found)
+        cleaned = clean_emails(emails)
+        if cleaned:
+            return cleaned
+
+    return []
+
+
+# ---------------------------------------------------------------------------
+# Strategy 8: WHOIS
 # ---------------------------------------------------------------------------
 
 
@@ -625,6 +659,7 @@ STRATEGY_ORDER = [
     ("Rastreo web profundo", "crawl"),
     ("Redes sociales", "social"),
     ("Patrón email + SMTP", "smtp"),
+    ("Buscar por teléfono", "phone"),
     ("Buscadores (Google/DDG/Bing)", "search"),
     ("Directorios españoles", "directories"),
     ("Google Maps", "gmaps"),
@@ -632,7 +667,7 @@ STRATEGY_ORDER = [
 ]
 
 
-def find_email_for_clinic(name: str, web: str, address: str) -> dict:
+def find_email_for_clinic(name: str, web: str, address: str, phone: str) -> dict:
     """Ejecuta todas las estrategias en cascada para encontrar el email."""
     result = {
         "name": name,
@@ -673,6 +708,9 @@ def find_email_for_clinic(name: str, web: str, address: str) -> dict:
             elif strategy_id == "smtp" and web:
                 emails = guess_and_verify_emails(web)
 
+            elif strategy_id == "phone" and phone:
+                emails = search_email_by_phone(phone, name)
+
             elif strategy_id == "search":
                 emails = search_email_engines(name, city)
 
@@ -707,7 +745,7 @@ def main():
 
     print("=" * 60)
     print("  BUSCADOR AVANZADO DE EMAILS")
-    print("  Sistema multi-estrategia (7 métodos)")
+    print("  Sistema multi-estrategia (8 métodos)")
     print("=" * 60)
 
     try:
@@ -731,6 +769,7 @@ def main():
         if not name:
             continue
         total_clinics += 1
+        phone = ws.cell(row=row_idx, column=2).value or ""
         email = ws.cell(row=row_idx, column=3).value
         address = ws.cell(row=row_idx, column=4).value or ""
 
@@ -747,6 +786,7 @@ def main():
             clinics_to_search.append({
                 "row": row_idx,
                 "name": str(name),
+                "phone": str(phone),
                 "web": web,
                 "address": str(address),
             })
@@ -756,8 +796,10 @@ def main():
     print(f"  Sin email (a buscar):       {len(clinics_to_search)}")
     sin_web = sum(1 for c in clinics_to_search if not c["web"])
     con_web = len(clinics_to_search) - sin_web
-    print(f"    - Con web (7 estrategias):         {con_web}")
-    print(f"    - Sin web (buscadores/directorios): {sin_web}")
+    con_phone = sum(1 for c in clinics_to_search if c["phone"].strip())
+    print(f"    - Con web (8 estrategias):          {con_web}")
+    print(f"    - Con teléfono:                     {con_phone}")
+    print(f"    - Sin web (teléfono/buscadores):    {sin_web}")
 
     if not clinics_to_search:
         print("\n  Todas las clínicas ya tienen email.")
@@ -768,10 +810,11 @@ def main():
     print(f"    1. Rastreo web profundo (hasta 40 págs, emails ofuscados)")
     print(f"    2. Redes sociales (Facebook, Instagram)")
     print(f"    3. Adivinar patrón + verificar SMTP (15 prefijos)")
-    print(f"    4. Buscadores (Google + DuckDuckGo + Bing)")
-    print(f"    5. Directorios (Doctoralia, PáginasAmarillas, TopDoctors...)")
-    print(f"    6. Ficha de Google Maps")
-    print(f"    7. WHOIS del dominio")
+    print(f"    4. Buscar por teléfono en buscadores")
+    print(f"    5. Buscadores (Google + DuckDuckGo + Bing)")
+    print(f"    6. Directorios (Doctoralia, PáginasAmarillas, TopDoctors...)")
+    print(f"    7. Ficha de Google Maps")
+    print(f"    8. WHOIS del dominio")
     print(f"\n  Buscando ({args.workers} hilos)...\n")
 
     found_count = 0
@@ -783,7 +826,7 @@ def main():
         futures = {
             executor.submit(
                 find_email_for_clinic,
-                c["name"], c["web"], c["address"]
+                c["name"], c["web"], c["address"], c["phone"]
             ): c
             for c in clinics_to_search
         }
