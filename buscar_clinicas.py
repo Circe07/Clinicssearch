@@ -316,7 +316,7 @@ def load_existing_clinics(output_path: str) -> list[dict]:
         return []
 
     try:
-        wb = load_workbook(output_path, read_only=True)
+        wb = load_workbook(output_path)
     except Exception as e:
         print(f"[AVISO] No se pudo leer el Excel existente ({e}). Se creará uno nuevo.")
         return []
@@ -328,20 +328,38 @@ def load_existing_clinics(output_path: str) -> list[dict]:
     ws = wb["Clínicas - Prospectos"]
     clinics = []
 
-    for row_idx, row in enumerate(ws.iter_rows(min_row=2, values_only=True), 2):
-        if not row or not row[0]:
+    for row_idx in range(2, ws.max_row + 1):
+        name = ws.cell(row=row_idx, column=1).value
+        if not name:
             continue
+
+        web_cell = ws.cell(row=row_idx, column=5)
+        if web_cell.hyperlink:
+            web = web_cell.hyperlink.target
+        elif web_cell.value and web_cell.value not in ("Ver web", None):
+            web = web_cell.value
+        else:
+            web = ""
+
+        maps_cell = ws.cell(row=row_idx, column=6)
+        if maps_cell.hyperlink:
+            google_maps = maps_cell.hyperlink.target
+        elif maps_cell.value and maps_cell.value not in ("Ver mapa", None):
+            google_maps = maps_cell.value
+        else:
+            google_maps = ""
+
         clinics.append({
-            "nombre": row[0] or "",
-            "telefono": row[1] or "",
-            "email": row[2] or "",
-            "direccion": row[3] or "",
-            "web": row[4] or "",
-            "google_maps": row[5] or "",
-            "calidad_web": row[6] or "",
-            "descripcion_web": row[7] or "",
-            "rating": row[8] if len(row) > 8 and row[8] is not None else "",
-            "num_reviews": row[9] if len(row) > 9 and row[9] is not None else "",
+            "nombre": name or "",
+            "telefono": ws.cell(row=row_idx, column=2).value or "",
+            "email": ws.cell(row=row_idx, column=3).value or "",
+            "direccion": ws.cell(row=row_idx, column=4).value or "",
+            "web": web,
+            "google_maps": google_maps,
+            "calidad_web": ws.cell(row=row_idx, column=7).value or "",
+            "descripcion_web": ws.cell(row=row_idx, column=8).value or "",
+            "rating": ws.cell(row=row_idx, column=9).value if ws.cell(row=row_idx, column=9).value is not None else "",
+            "num_reviews": ws.cell(row=row_idx, column=10).value if ws.cell(row=row_idx, column=10).value is not None else "",
             "oportunidad": True,
         })
 
@@ -532,7 +550,10 @@ def main():
     filtered_no_oportunidad = 0
     for c in clinics_raw:
         reviews = c["num_reviews"]
-        review_count = int(reviews) if str(reviews).isdigit() else 0
+        try:
+            review_count = int(float(reviews)) if reviews != "" else 0
+        except (ValueError, TypeError):
+            review_count = 0
         if review_count < args.min_reviews:
             filtered_reviews += 1
             continue

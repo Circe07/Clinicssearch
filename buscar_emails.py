@@ -24,11 +24,9 @@ import argparse
 import json
 import re
 import smtplib
-import socket
 import sys
-import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from urllib.parse import quote_plus, urljoin, urlparse
+from urllib.parse import unquote, urljoin, urlparse
 
 import dns.resolver
 import requests
@@ -260,18 +258,25 @@ def _search_duckduckgo(query: str, num: int = 5) -> list[str]:
     try:
         resp = requests.get(
             "https://html.duckduckgo.com/html/",
-            params={"q": query},
-            headers=HEADERS_BROWSER,
+            data={"q": query},
+            headers={**HEADERS_BROWSER, "Content-Type": "application/x-www-form-urlencoded"},
             timeout=10,
         )
         if resp.status_code != 200:
             return []
         urls = []
         soup = BeautifulSoup(resp.text, "html.parser")
-        for a in soup.find_all("a", class_="result__a", href=True):
+        for a in soup.find_all("a", href=True):
             href = a["href"]
-            if href.startswith("http"):
-                urls.append(href)
+            cls = " ".join(a.get("class", []))
+            if "result__a" in cls or "result-link" in cls:
+                if href.startswith("http") and "duckduckgo.com" not in href:
+                    urls.append(href)
+            elif href.startswith("//duckduckgo.com/l/?uddg="):
+                real = href.split("uddg=")[1].split("&")[0]
+                real = unquote(real)
+                if real.startswith("http"):
+                    urls.append(real)
         return urls[:num]
     except Exception:
         return []
